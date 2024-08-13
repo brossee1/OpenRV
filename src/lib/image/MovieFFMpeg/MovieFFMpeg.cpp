@@ -21,9 +21,8 @@
 #include <TwkUtil/sgcHop.h>
 #include <iostream>
 #include <iomanip>
-#include <math.h>
 #include <algorithm>
-#include <stdlib.h>
+#include <cstdlib>
 #include <stl_ext/stl_ext_algo.h>
 #include <stl_ext/string_algo.h>
 #include <string>
@@ -36,7 +35,6 @@
 #include <boost/thread/lock_guard.hpp>
 #include <boost/algorithm/string.hpp>
 #include <mp4v2Utils/mp4v2Utils.h>
-#include <string>
 #include <cstring>
 
 extern "C" {
@@ -48,7 +46,6 @@ extern "C" {
 #include <libavutil/timecode.h>
 #include <libavutil/display.h>
 #include <libswscale/swscale.h>
-//#include <libavcodec/ass_split.h>
 }
 
 static ENVVAR_BOOL( evUseUploadedMovieForStreaming, "RV_SHOTGRID_USE_UPLOADED_MOVIE_FOR_STREAMING", false );
@@ -626,6 +623,9 @@ const char* ignoreMetadataFieldsArray[] = {
     "duration", // We ignore it here, since its explicitly added elsewhere.
     0};
 
+AVPixelFormat hardwarePixelFormat = AV_PIX_FMT_NONE;
+AVBufferRef* hardwareDeviceContext = nullptr;
+
 //----------------------------------------------------------------------
 //
 // Static Helpers
@@ -951,6 +951,37 @@ void copyImage(AVFrame* dst, const AVFrame* src,
   }
 }
 
+int hardwareDecoderInit(AVCodecContext* codecContext, const AVHWDeviceType deviceType)
+{
+    const int result = av_hwdevice_ctx_create(&hardwareDeviceContext, deviceType, nullptr, nullptr, 0);
+
+    if (result < 0)
+    {
+        std::cerr << "ERROR: Failed to create specified hardware device type.\n";
+        return result;
+    }
+
+    codecContext->hw_device_ctx = av_buffer_ref(hardwareDeviceContext);
+
+    return result;
+}
+
+AVPixelFormat getHardwareFormat(AVCodecContext* /*codecContext*/, const AVPixelFormat* pixelFormats)
+{
+    const enum AVPixelFormat *pixelFormat = nullptr;
+
+    for (pixelFormat = pixelFormats; *pixelFormat != -1; pixelFormat++)
+    {
+        if (*pixelFormat == hardwarePixelFormat)
+        {
+            return *pixelFormat;
+        }
+    }
+
+    std::cerr << "ERROR: Failed to get hardware surface format.\n";
+    return AV_PIX_FMT_NONE;
+}
+
 } // close empty namespace
 
 //----------------------------------------------------------------------
@@ -1014,6 +1045,7 @@ MovieFFMpegReader::close()
         if (track->isOpen)
         {
             avcodec_free_context(&track->avCodecContext);
+            av_buffer_unref(&hardwareDeviceContext);
         }
         ContextPool::flushContext(this, track->number);
         delete track;
@@ -1026,6 +1058,7 @@ MovieFFMpegReader::close()
         if (track->isOpen)
         {
             avcodec_free_context(&track->avCodecContext);
+            av_buffer_unref(&hardwareDeviceContext);
         }
         ContextPool::flushContext(this, track->number);
         delete track;
@@ -1225,7 +1258,7 @@ bool
 MovieFFMpegReader::openAVCodec(int index, AVCodecContext** avCodecContext)
 {
     // Make sure the format is opened
-    if (m_avFormatContext == 0)
+    if (m_avFormatContext == nullptr)
     {
         openAVFormat();
         findStreamInfo();
@@ -1233,12 +1266,47 @@ MovieFFMpegReader::openAVCodec(int index, AVCodecContext** avCodecContext)
 
     // Get the codec context
     AVStream* avStream = m_avFormatContext->streams[index];
-    if (*avCodecContext && avcodec_is_open(*avCodecContext)) return true;
+    if (*avCodecContext != nullptr && avcodec_is_open(*avCodecContext) != 0)
+    {
+        return true;
+    }
 
+    const AVCodec* avCodec = nullptr;
+    AVHWDeviceType deviceType = AV_HWDEVICE_TYPE_NONE;
+    int videoStream = -1;
+    
     // Find the decoder for the av stream
-    const AVCodec* avCodec = 0;
     switch (avStream->codecpar->codec_id)
     {
+        case AV_CODEC_ID_PRORES:
+        {
+            deviceType = av_hwdevice_find_type_by_name("videotoolbox");
+            if (deviceType == AV_HWDEVICE_TYPE_NONE)
+            {
+                std::cerr << "ERROR: Device type" << deviceType << "is not supported.\n";
+                return false;
+            }
+
+            videoStream = av_find_best_stream(m_avFormatContext, AVMEDIA_TYPE_VIDEO, -1, -1, &avCodec, 0);
+            if (videoStream < 0)
+            {
+                std::cerr << "ERROR: MovieFFMpeg: Failed to find a video stream in " << m_filename << endl;
+                return false;
+            }
+
+            const AVCodecHWConfig *config = avcodec_get_hw_config(avCodec, videoStream);
+            if (config == nullptr)
+            {
+                std::cerr << "ERROR: Decoder " << avCodec->name << " does not support device type " << av_hwdevice_get_type_name(deviceType) << '\n';
+                return false;
+            }
+            // Check if the hardware device context flag is set and the device type matches
+            if ((config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) != 0 && config->device_type == deviceType)
+            {
+                hardwarePixelFormat = config->pix_fmt;
+            }
+            break;
+        }
         case AV_CODEC_ID_H264:
         case AV_CODEC_ID_H265:
             // we want to read SPS and PPS NALs at the beginning of H.264 and H.264 stream.
@@ -1250,34 +1318,45 @@ MovieFFMpegReader::openAVCodec(int index, AVCodecContext** avCodecContext)
             avCodec = avcodec_find_decoder(avStream->codecpar->codec_id);
             break;
     }
-    if (avCodec == 0)
+    if (avCodec == nullptr)
     {
-        cout << "ERROR: MovieFFMpeg: Unsupported codec_id '" <<
+        std::cerr << "ERROR: MovieFFMpeg: Unsupported codec_id '" <<
             avStream->codecpar->codec_id << "' in " << m_filename << endl;
         return false;
     }
 
     *avCodecContext = avcodec_alloc_context3(avCodec);
-    if (!*avCodecContext) {
-        cout << "ERROR: MovieFFMpeg: Failed to allocate codec context '" <<
-            avCodec->name << "' for " << m_filename << endl;
-        return false;;
+    if (*avCodecContext == nullptr)
+    {
+        std::cerr << "ERROR: MovieFFMpeg: Failed to allocate codec context '" <<
+            avCodec->name << "' for " << m_filename << '\n';
+        return false;
     }
 
-    // Copy codec parameters from input stream to output codec context
-    if (avcodec_parameters_to_context(*avCodecContext, avStream->codecpar) < 0) {
-        cout << "ERROR: MovieFFMpeg: Failed to copy '" << avCodec->name <<
-            "' codec parameters to decoder context for " << m_filename << endl;
+    if (avcodec_parameters_to_context(*avCodecContext, avStream->codecpar) < 0)
+    {
+        std::cerr << "ERROR: MovieFFMpeg: Failed to copy '" << avCodec->name <<
+            "' codec parameters to decoder context for " << m_filename << '\n';
         avcodec_free_context(avCodecContext);
         return false;
     }
 
+    if (avStream->codecpar->codec_id == AV_CODEC_ID_PRORES)
+    {
+        (*avCodecContext)->get_format = getHardwareFormat;
+
+        if (hardwareDecoderInit(*avCodecContext, deviceType) < 0)
+        {
+            return false;
+        }
+    }
+
     // Open the codec
     (*avCodecContext)->thread_count = m_io->codecThreads();
-    if (avcodec_open2(*avCodecContext, avCodec, 0) < 0)
+    if (avcodec_open2(*avCodecContext, avCodec, nullptr) < 0)
     {
-        cout << "ERROR: MovieFFMpeg: Failed to open codec '" <<
-            avCodec->name << "' for " << m_filename << endl;
+        std::cerr << "ERROR: MovieFFMpeg: Failed to open codec '" <<
+            avCodec->name << "' for " << m_filename << '\n';
         avcodec_free_context(avCodecContext);
         return false;
     }
@@ -1285,12 +1364,12 @@ MovieFFMpegReader::openAVCodec(int index, AVCodecContext** avCodecContext)
     // Check if this is a valid Video Pixel Format
     if ((*avCodecContext)->codec_type == AVMEDIA_TYPE_VIDEO)
     {
-        AVPixelFormat nativeFormat = (*avCodecContext)->pix_fmt;
+        const AVPixelFormat nativeFormat = (*avCodecContext)->pix_fmt;
         const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(nativeFormat);
-        if (desc == NULL)
+        if (desc == nullptr)
         {
-            cout << "ERROR: MovieFFMpeg: Invalid pixel format! " <<
-                m_filename << endl;
+            std::cerr << "ERROR: MovieFFMpeg: Invalid pixel format! " <<
+                m_filename << '\n';
             avcodec_free_context(avCodecContext);
             return false;
         }
@@ -1301,18 +1380,25 @@ MovieFFMpegReader::openAVCodec(int index, AVCodecContext** avCodecContext)
     //  previous state
     //
 
-    VideoTrack* vTrack;
-    AudioTrack* aTrack;
-    trackFromStreamIndex(index, vTrack, aTrack);
+    VideoTrack* videoTrack;
+    AudioTrack* audioTrack;
+    trackFromStreamIndex(index, videoTrack, audioTrack);
 
-    if (vTrack) vTrack->lastDecodedVideo = -1;
-    if (aTrack) aTrack->lastDecodedAudio = AV_NOPTS_VALUE;
+    if (videoTrack != nullptr)
+    {
+        videoTrack->lastDecodedVideo = -1;
+    }
+
+    if (audioTrack != nullptr)
+    {
+        audioTrack->lastDecodedAudio = AV_NOPTS_VALUE;
+    }
 
     // Make sure to only use allowed codecs
     if (!m_io->codecIsAllowed((*avCodecContext)->codec->name, true))
     {
-        cout << "ERROR: MovieFFMpeg: Unallowed codec '" <<
-            (*avCodecContext)->codec->name << "' in " << m_filename << endl;
+        std::cerr << "ERROR: MovieFFMpeg: Unallowed codec '" <<
+            (*avCodecContext)->codec->name << "' in " << m_filename << '\n';
         avcodec_free_context(avCodecContext);
         return false;
     }
@@ -3430,8 +3516,25 @@ MovieFFMpegReader::decodeImageAtFrame(int inframe, VideoTrack* track)
     // outFrame          - AVFrame linked to output FrameBuffer to copy into
     //
 
-    AVFrame* outFrame = 0;
+    AVFrame* outFrame = nullptr;
+    AVFrame* softwareFrame = nullptr;
     outFrame = av_frame_alloc();
+    softwareFrame = av_frame_alloc();
+    AVFrame* tempFrame = nullptr;
+    int result = 0;
+
+    if (track->videoFrame->format == hardwarePixelFormat)
+    {
+        // retrieve data from GPU to CPU
+        result = av_hwframe_transfer_data(softwareFrame, track->videoFrame, 0);
+        if (result < 0)
+        {
+            std::cerr << "ERROR: Failed to transfer data to system memory\n";
+        }
+        tempFrame = softwareFrame;
+    } else {
+        tempFrame = track->videoFrame;
+    }
 
     //
     // Determine the native pixel format and make an effort to reconfigure the
@@ -3440,7 +3543,7 @@ MovieFFMpegReader::decodeImageAtFrame(int inframe, VideoTrack* track)
     // we will have to convert so keep track if the format needs conversion.
     //
 
-    AVPixelFormat nativeFormat = videoCodecContext->pix_fmt;
+    AVPixelFormat nativeFormat = videoCodecContext->sw_pix_fmt;
     const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(nativeFormat);
     int bitSize = desc->comp[0].depth - desc->comp[0].shift;
     int numPlanes = 0;
@@ -3452,7 +3555,7 @@ MovieFFMpegReader::decodeImageAtFrame(int inframe, VideoTrack* track)
         FrameBuffer::USHORT : FrameBuffer::UCHAR;
     FrameBuffer::StringVector chans(3);
     FrameBuffer* out = 0;
-    av_image_fill_arrays(outFrame->data, outFrame->linesize, 0, nativeFormat, width, height, 1);
+    av_image_fill_arrays(outFrame->data, outFrame->linesize, nullptr, nativeFormat, width, height, 1);
 
     // Note: We're about to use offset_plus1 here to derive the RGB channel
     // ordering. Here is the definition of offset_plus1 according to the FFmpeg
@@ -3530,7 +3633,7 @@ MovieFFMpegReader::decodeImageAtFrame(int inframe, VideoTrack* track)
         DBL (DB_VIDEO, "Converting video format");
 
         // Reuse or allocate a new image conversion context
-        AVPixelFormat original = videoCodecContext->pix_fmt;
+        AVPixelFormat original = videoCodecContext->sw_pix_fmt;
         AVPixelFormat conv = getBestRVFormat(original);
         HOP_PROF("sws_getCachedContext()");
         // Note: If track->imgConvertContext is NULL, sws_getCachedContext just
@@ -3539,15 +3642,15 @@ MovieFFMpegReader::decodeImageAtFrame(int inframe, VideoTrack* track)
         // case, it returns the current context. Otherwise, it frees context and
         // gets a new context with the new parameters.
         track->imgConvertContext = sws_getCachedContext(track->imgConvertContext, width, height,
-            original, width, height, conv, SWS_BICUBIC, 0, 0, 0);
-        if (track->imgConvertContext == 0) 
+            static_cast<AVPixelFormat>(tempFrame->format), width, height, conv, SWS_BICUBIC, 0, 0, 0);
+        if (track->imgConvertContext == 0)
         {
             TWK_THROW_EXC_STREAM("Can't initialize conversion context!");
         }
 
         HOP_PROF("sws_scale()");
-        sws_scale(track->imgConvertContext, track->videoFrame->data,
-            track->videoFrame->linesize, 0, height,
+        sws_scale(track->imgConvertContext, tempFrame->data,
+            tempFrame->linesize, 0, height,
             outFrame->data, outFrame->linesize);
     }
     else
@@ -3557,6 +3660,7 @@ MovieFFMpegReader::decodeImageAtFrame(int inframe, VideoTrack* track)
 
     // Clean up
     av_frame_free(&outFrame);
+    av_frame_free(&softwareFrame);
 
     //
     // XXX For now we will handle any rotation in software. Eventually we plan
@@ -5335,12 +5439,14 @@ MovieFFMpegWriter::write(Movie* inMovie)
     {
         AudioTrack* track = m_audioTracks[i];
         avcodec_free_context(&track->avCodecContext);
+        av_buffer_unref(&hardwareDeviceContext);
         delete track;
     }
     for (unsigned int i = 0; i < m_videoTracks.size(); i++)
     {
         VideoTrack* track = m_videoTracks[i];
         avcodec_free_context(&track->avCodecContext);
+        av_buffer_unref(&hardwareDeviceContext);
         delete track;
     }
     if (m_audioSamples) av_freep(&m_audioSamples);
@@ -5348,6 +5454,10 @@ MovieFFMpegWriter::write(Movie* inMovie)
     {
         avformat_close_input(&m_avFormatContext);
         avformat_free_context(m_avFormatContext);
+    }
+    if (hardwareDeviceContext)
+    {
+        av_buffer_unref(&hardwareDeviceContext);
     }
 
     return true;
